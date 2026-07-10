@@ -1,0 +1,34 @@
+-- ============================================================================
+-- 文件：/UR5/Target/Script（追踪任务）
+-- 功能：订阅 ROS 话题 /f_M_o，接收视觉节点发布的四元数+平移，
+--       并设置到 Target 对象上，从而驱动 UR5 进行跟踪。
+-- 说明：这是视觉与仿真之间的桥梁，完全依赖 ROS 话题，不依赖仿真内部数据。
+-- ============================================================================
+
+sim = require('sim')
+simROS = require('simROS')
+
+local sub
+local currentPos = {0, 0, 0}
+local currentOri = {0, 0, 1, 0}
+
+function sysCall_init()
+    targetHandle = sim.getObject('..')
+    sub = simROS.subscribe('/f_M_o', 'std_msgs/Float32MultiArray', 'sysCallBack')
+end
+
+function sysCallBack(msg)
+    -- 提取四元数 (qx,qy,qz,qw) 和平移 (tx,ty,tz)
+    currentPos = {msg.data[5], msg.data[6], msg.data[7]}
+    currentOri = { msg.data[1], msg.data[2], msg.data[3], msg.data[4] }
+    -- 设置 Target 的位姿
+    sim.setObjectPosition(targetHandle, -1, currentPos)
+    sim.setObjectQuaternion(targetHandle, -1, currentOri)
+end
+
+function sysCall_cleanup()
+    if sub then
+        simROS.shutdownSubscriber(sub)
+        sub = nil
+    end
+end

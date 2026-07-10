@@ -1,0 +1,36 @@
+-- ============================================================================
+-- 文件：/UR5/Script（追踪任务）
+-- 功能：在 CoppeliaSim 中设置逆运动学（IK），使 UR5 末端（Tip）始终跟踪
+--       Target 对象的位姿。Target 的位姿由外部视觉节点通过 ROS 话题 /f_M_o
+--       提供，因此本脚本不依赖仿真内部数据，真实可用。
+-- 说明：与抛接任务不同，本脚本没有预测、没有夹爪控制，仅做简单的位姿跟随。
+-- ============================================================================
+
+sim = require('sim')
+simIK = require('simIK')
+simROS = require('simROS')
+
+-- 初始化：创建 IK 环境，绑定底座、末端和目标点
+function sysCall_init()
+    simTip = sim.getObject('../Tip')
+    simTarget = sim.getObject('../Target')
+    modelBase = sim.getObject('..')
+
+    ikEnv = simIK.createEnvironment()
+    ikGroup = simIK.createIkGroup(ikEnv)
+    -- 使用伪逆法求解 IK（较简单）
+    simIK.setIkGroupCalculation(ikEnv, ikGroup, simIK.method_pseudo_inverse, 0.1, 50)
+    simIK.addIkElementFromScene(ikEnv, ikGroup, modelBase, simTip, simTarget, simIK.constraint_pose)
+end
+
+-- 每次仿真步调用：执行 IK，使末端到达 Target 位置
+function sysCall_actuation()
+    local result = simIK.applyIkEnvironmentToScene(ikEnv, ikGroup, true)
+    if result ~= simIK.result_success then
+        -- 可输出错误信息（可选）
+        -- sim.addLog(sim.verbosity_scriptwarnings, "IK solver failed.")
+    end
+end
+
+-- 注意：本脚本仅做 IK，不涉及任何目标位置计算。
+--       Target 的位置由 /UR5/Target/Script 通过订阅 /f_M_o 更新。

@@ -1,0 +1,598 @@
+-- ============================================================================
+-- 文件：/UR5/Script (CoppeliaSim 仿真脚本)
+-- 功能：控制 UR5 机械臂追踪并抓取一个移动的目标（抛接任务）。
+-- 说明：本脚本直接通过 sim.getObjectPosition() 获取目标的真实坐标，
+--       此为仿真“上帝视角”，仅用于算法验证。真实系统应替换为视觉位姿输入。
+-- 作者：基于 CoppeliaSim + ViSP 的抛接演示
+-- 版本：仿真验证版
+-- ============================================================================
+
+-- 加载必要的 CoppeliaSim 模块
+sim = require('sim')          -- 基础 API
+simIK = require('simIK')      -- 逆运动学
+simROS = require('simROS')    -- ROS 通信（发布关节状态用）
+simUI = require('simUI')      -- 夹爪控制 UI
+
+-- ------------------------ 全局变量 ------------------------
+
+-- ROS 发布器（用于发布关节角度供外部监视）
+local pub
+
+-- UR5 的 6 个关节句柄
+local jointHandles
+-- 关节角度缓存（发布用）
+local jointAngles = {}
+
+-- 目标物体句柄（被追踪的球体/立方体等）
+local targetObjectHandle = -1
+
+-- 跟踪状态标志
+local isTracking = false
+
+-- 初始接近距离（末端与目标预测点之间的安全偏移量）
+local initialApproachDistance = 0.05
+local currentApproachDistance = initialApproachDistance
+
+-- 检测范围（超过此距离开始跟踪）
+local detectionRange = 1.5
+
+-- 用于计算速度的上帧位置
+local lastObjectPos = {0, 0, 0}
+-- 目标当前速度（由差分估算）
+local objectVelocity = {0, 0, 0}
+
+-- 机械臂末端（Tip）句柄
+local simTip = -1
+
+-- 重力加速度（用于下落轨迹预测）
+local g = 0.2
+
+-- 手臂反应时间（用于预测补偿）
+local armReactionTime = 0.3
+
+-- 上次检测到目标的时间（用于超时判断）
+local lastDetectionTime = 0
+
+-- 接近阶段：0=远，1=中，2=近（调整接近距离）
+local approachPhase = 0
+
+-- 预测时间参数（远/近距离）
+local longPred   = 2
+local shortPred  = 0.2
+local predTime   = longPred
+
+-- 抓取状态
+local grasped = false
+
+-- 抓取阈值（末端与目标距离小于此值触发夹爪闭合）
+local captureThreshold = 0.05
+
+-- 夹爪相关
+local gripperJoints = {}        -- 夹爪关节句柄
+local gripperClosePos = 0.0     -- 夹爪闭合位置（角度）
+local gripperAutoClosed = false -- 是否已自动闭合（未使用）
+
+-- 夹爪力控模式变量
+local gripState   = 0           -- 0=张开，1=闭合
+local sliderV     = 0           -- 手指角度滑块值（0~100）
+local maxForce    = 15          -- 夹爪最大力（N）
+
+-- ========================= 辅助函数 =========================
+
+-- 计算三维向量的模长
+function vectorLength(v)
+    return math.sqrt(v[1]*v[1] + v[2]*v[2] + v[3]*v[3])
+end
+
+-- 归一化三维向量
+function vectorNormalize(v)
+    local len = vectorLength(v)
+    if len < 1e-6 then
+        return {0, 0, 1}  -- 若零向量则返回 Z 轴
+    end
+    return {v[1]/len, v[2]/len, v[3]/len}
+end
+
+-- ========================= 初始化 =========================
+
+function sysCall_init()
+    -- 获取场景中关键对象的句柄
+    simTip = sim.getObject('../Tip')          -- UR5 末端
+    local simTarget = sim.getObject('../Target')  -- IK 目标点
+    local modelBase = sim.getObject('..')     -- UR5 底座
+
+    -- 初始预测时间设为远距离
+    predTime = longPred
+    
+    -- ★ 直接查找目标物体（不使用视觉）
+    targetObjectHandle = findTargetObject()
+    
+    if targetObjectHandle == -1 then
+        sim.addLog(sim.verbosity_scriptwarnings, "未找到目标物体，请添加 Sphere/Cube 等形状")
+    else
+        sim.addLog(sim.verbosity_scriptinfos, "目标物体: " .. sim.getObjectName(targetObjectHandle))
+        -- 记录初始位置（用于速度计算）
+        lastObjectPos = sim.getObjectPosition(targetObjectHandle, -1)
+    end
+    
+    -- 创建 IK 环境与组
+    ikEnv = simIK.createEnvironment()
+    ikGroup = simIK.createIkGroup(ikEnv)
+    -- 设置 IK 求解方法（DLS，阻尼最小二乘）
+    simIK.setIkGroupCalculation(ikEnv, ikGroup, simIK.method_damped_least_squares, 0.05, 50)
+    -- 添加 IK 元素：从底座到末端，约束为位姿（位置+姿态）
+    simIK.addIkElementFromScene(ikEnv, ikGroup, modelBase, simTip, simTarget, simIK.constraint_pose)
+    
+    -- 获取 UR5 六个关节句柄（按顺序）
+    jointHandles = {}
+    for i = 1, 6 do
+        jointHandles[i] = sim.getObject('../joint', {index = i - 1})
+    end
+    
+    -- 创建 ROS 发布器，发布关节角度（用于外部监视，如 Rviz）
+    pub = simROS.advertise('/ur5_joint_states', 'std_msgs/Float32MultiArray')
+    
+    -- ---------- 夹爪初始化 ----------
+    -- 夹爪的两个开合关节（平行夹爪）
+    closingJointHandles = {
+        sim.getObject('../openCloseJoint'),
+        sim.getObject('../openCloseJoint0')
+    }
+    -- 夹爪旋转关节（手指角度调节）
+    rotJointHandles = {
+        sim.getObject('../jointA_0'),
+        sim.getObject('../jointA_2')
+    }
+    modelHandle = sim.getObject('..')
+
+    -- 设置夹爪为力控模式（速度控制 + 力矩限制）
+    for i = 1, 2 do
+        sim.setJointMode(closingJointHandles[i], sim.jointmode_force, 0)
+        sim.setJointTargetVelocity(closingJointHandles[i], 0)
+        sim.setJointMaxForce(closingJointHandles[i], maxForce)
+    end
+
+    -- 创建 UI 控制界面（夹爪开关、手指角度滑块）
+    createUI()
+end
+
+-- ========================= 查找目标（仿真专用） =========================
+
+-- 功能：在场景中寻找一个合适的形状物体作为目标。
+-- 按名称列表查找，若无则遍历所有形状，排除关节、连杆等内部结构。
+-- 返回：物体句柄，若未找到返回 -1。
+-- ★ 此方法完全依赖仿真场景，真实系统应改为视觉检测。
+function findTargetObject()
+    local possibleNames = {"Sphere", "Cube","Ball", "Target", "Object",  "Cylinder"}
+    for _, name in ipairs(possibleNames) do
+        local handle = sim.getObject("/" .. name)
+        if handle ~= -1 then return handle end
+    end
+    
+    local allObjects = sim.getObjectsInTree(sim.handle_scene, sim.handle_all, 0)
+    for i, obj in ipairs(allObjects) do
+        local objName = sim.getObjectName(obj)
+        local objType = sim.getObjectType(obj)
+        if objType == sim.object_shape_type then
+            if not string.find(objName, "joint") and 
+               not string.find(objName, "link") and 
+               not string.find(objName, "tip") and
+               not string.find(objName, "target") then
+                sim.addLog(sim.verbosity_scriptinfos, "自动选择目标: " .. objName)
+                return obj
+            end
+        end
+    end
+    return -1
+end
+
+-- ========================= 独立线程：发布关节状态 =========================
+
+-- 功能：以固定频率（约 20Hz）发布 UR5 各关节角度到 ROS。
+-- 此函数在独立线程中运行，不影响主控制循环。
+function sysCall_thread()
+    while sim.getSimulationState() ~= sim.simulation_advancing_abouttostop do
+        local jointAngles = {}
+        for i = 1, 6 do
+            jointAngles[i] = sim.getJointPosition(jointHandles[i])
+        end
+        -- 构造 MultiArray 消息并发布
+        local jointStateMsg = {
+            layout = {
+                dim = {{label = "length", size = 6, stride = 1}},
+                data_offset = 0
+            },
+            data = jointAngles
+        }
+        simROS.publish(pub, jointStateMsg)
+        sim.wait(0.05)  -- 20 Hz
+    end
+end
+
+-- ========================= 主控制循环（每次仿真步调用） =========================
+
+-- 功能：执行目标检测（仿真）、速度估算、拦截点计算、IK 求解、夹爪力控。
+-- 每次仿真步（actuation pass）被 CoppeliaSim 调用。
+function sysCall_actuation()
+    -- 1. 检测目标并决定是否跟踪（此处直接读取场景）
+    autoDetectAndTrack()
+    
+    -- 2. 若正在跟踪，更新 IK 目标点位置（拦截点）
+    if isTracking and targetObjectHandle ~= -1 then
+        updateTargetPositionAndOrientation()
+    end
+    
+    -- 3. 检查是否达到抓取条件（距离够近）
+    simpleGrabOnProximity()
+
+    -- 4. 应用 IK 求解，使末端到达目标点
+    local result = simIK.applyIkEnvironmentToScene(ikEnv, ikGroup, true)
+    if result ~= simIK.result_success then
+        handleIKFailure()  -- 若 IK 失败，尝试重试或记录日志
+    else
+        if isTracking then
+            checkGraspStatus()  -- 输出接近信息（仅日志）
+        end
+    end
+    
+    -- 5. 夹爪力控：根据 gripState 控制开合速度
+    if gripState == 1 then
+        -- 闭合模式：根据接触力调整速度
+        local f1 = math.abs(sim.getJointForce(closingJointHandles[1]))
+        local f2 = math.abs(sim.getJointForce(closingJointHandles[2]))
+        local forceTh = 4          -- 接触力阈值
+        local vBase   = -0.15      -- 正常闭合速度
+        local vYield  = -0.01      -- 碰到物体后减速（柔性夹持）
+        if f1 > forceTh or f2 > forceTh then
+            sim.setJointTargetVelocity(closingJointHandles[1], vYield)
+            sim.setJointTargetVelocity(closingJointHandles[2], vYield)
+        else
+            sim.setJointTargetVelocity(closingJointHandles[1], vBase)
+            sim.setJointTargetVelocity(closingJointHandles[2], vBase)
+        end
+    else
+        -- 张开模式：正向速度张开
+        sim.setJointTargetVelocity(closingJointHandles[1], 0.02)
+        sim.setJointTargetVelocity(closingJointHandles[2], 0.02)
+    end
+end
+
+-- ========================= 目标检测与追踪决策 =========================
+
+-- 功能：检查目标是否在跟踪范围内，更新跟踪状态。
+-- ★ 直接使用 sim.getObjectPosition 获取真实位置（作弊）
+function autoDetectAndTrack()
+    if targetObjectHandle == -1 then
+        targetObjectHandle = findTargetObject()
+        if targetObjectHandle == -1 then return end
+    end
+    
+    -- 获取末端位置和目标位置
+    local tipPos = sim.getObjectPosition(simTip, -1)
+    local objectPos = sim.getObjectPosition(targetObjectHandle, -1)
+    local distance = math.sqrt(
+        (objectPos[1] - tipPos[1])^2 +
+        (objectPos[2] - tipPos[2])^2 +
+        (objectPos[3] - tipPos[3])^2
+    )
+    
+    -- 根据距离更新接近阶段（调整拦截偏移量）
+    updateApproachPhase(distance)
+    -- 计算目标速度（差分）
+    calculateObjectVelocity()
+    
+    -- 判断目标是否正在朝机械臂快速接近（用于提前触发跟踪）
+    local speed = vectorLength(objectVelocity)
+    local isApproachingQuickly = speed > 1.0 and isObjectApproachingArm(objectPos, objectVelocity, tipPos)
+    
+    -- 跟踪条件：距离小于检测范围 或 目标快速接近
+    if (not isTracking and (distance <= detectionRange or isApproachingQuickly)) then
+        isTracking = true
+        lastDetectionTime = sim.getSimulationTime()
+        approachPhase = 0
+        currentApproachDistance = initialApproachDistance
+        sim.addLog(sim.verbosity_scriptinfos, "开始追踪，距离: " .. string.format("%.2f", distance) .. "m")
+    -- 停止跟踪条件：距离过大且超时
+    elseif isTracking and distance > detectionRange * 1.5 and sim.getSimulationTime() - lastDetectionTime > 2.0 then
+        isTracking = false
+        approachPhase = 0
+        currentApproachDistance = initialApproachDistance
+        sim.addLog(sim.verbosity_scriptinfos, "目标超出范围，停止跟踪")
+    end
+end
+
+-- 根据距离调整接近阶段（影响拦截点偏移量）
+function updateApproachPhase(distance)
+    if not isTracking then return end
+    if distance > 0.5 then
+        approachPhase = 0
+        currentApproachDistance = 0.04
+    elseif distance > 0.2 then
+        approachPhase = 1
+        currentApproachDistance = 0.02 + 0.02*(distance/0.5)
+    else
+        approachPhase = 2
+        currentApproachDistance = math.max(0.005, 0.01*(distance/0.2))
+    end
+end
+
+-- 判断目标是否正朝向末端运动（用于提前跟踪）
+function isObjectApproachingArm(objectPos, objectVel, tipPos)
+    local toArm = {
+        tipPos[1] - objectPos[1],
+        tipPos[2] - objectPos[2],
+        tipPos[3] - objectPos[3]
+    }
+    toArm = vectorNormalize(toArm)
+    local velNorm = vectorNormalize(objectVel)
+    local dotProduct = toArm[1]*velNorm[1] + toArm[2]*velNorm[2] + toArm[3]*velNorm[3]
+    return dotProduct > 0.7  -- 速度方向与朝向末端的方向夹角小于 ~45°
+end
+
+-- ========================= 速度估算 =========================
+
+-- 功能：通过前后帧位置差除以时间步长计算目标速度。
+-- ★ 依赖真实位置数据。
+function calculateObjectVelocity()
+    local currentPos = sim.getObjectPosition(targetObjectHandle, -1)
+    local timeStep = sim.getFloatParameter(sim.floatparam_simulation_time_step)
+    objectVelocity = {
+        (currentPos[1] - lastObjectPos[1]) / timeStep,
+        (currentPos[2] - lastObjectPos[2]) / timeStep,
+        (currentPos[3] - lastObjectPos[3]) / timeStep
+    }
+    lastObjectPos = {currentPos[1], currentPos[2], currentPos[3]}
+end
+
+-- ========================= 拦截点计算 =========================
+
+-- 功能：根据目标当前位置、速度，预测未来位置，并增加偏移，生成 IK 目标点。
+function updateTargetPositionAndOrientation()
+    local simTarget = sim.getObject('../Target')
+    local objectPos = sim.getObjectPosition(targetObjectHandle, -1)
+    local speed = vectorLength(objectVelocity)
+    
+    -- 计算带预测的拦截点
+    local interceptPos = calculateInterceptPosition(objectPos, objectVelocity, speed)
+    
+    -- ★ 直接设置 Target 位置（覆盖可能来自 ROS 订阅的数据）
+    sim.setObjectPosition(simTarget, -1, interceptPos)
+    -- 设置 Target 的姿态（固定为便于抓取的方向）
+    setTargetOrientation(simTarget, objectVelocity)
+end
+
+-- 核心预测算法
+function calculateInterceptPosition(objectPos, objectVel, speed)
+    local basePos = sim.getObjectPosition(sim.getObject('..'), -1)
+    -- 计算目标与底座的水平距离
+    local horizDist = math.sqrt((objectPos[1]-basePos[1])^2 + (objectPos[2]-basePos[2])^2)
+    
+    -- 根据水平距离决定基础预测时间
+    local predTime
+    if horizDist > 0.9 then
+        predTime = longPred
+    elseif horizDist > 0.5 then
+        predTime = 0.7
+    else
+        predTime = 0.3
+    end
+    
+    -- 根据速度和高度调整预测时间
+    local speedFactor = math.min(1.0, speed / 5.0)
+    local heightFactor = math.min(1.0, objectPos[3] / 2.0)
+    local predictionTime = predTime + speedFactor * 0.2 + heightFactor * 0.1
+    predictionTime = math.max(0.05, math.min(0.6, predictionTime))
+    -- 加上手臂反应时间
+    predictionTime = predictionTime + armReactionTime
+    -- 修正：直接使用预定义值（调试用）
+    predictionTime = predTime - 0.1  -- 注意：这行会覆盖上面计算结果，可能是作者调试遗留
+    
+    -- 预测位置：匀速运动 + 重力补偿（仅 Z 方向）
+    local interceptPos = {
+        objectPos[1] + objectVel[1] * predictionTime,
+        objectPos[2] + objectVel[2] * predictionTime,
+        objectPos[3] + objectVel[3] * predictionTime - 0.5 * g * predictionTime * predictionTime
+    }
+    
+    -- 根据接近阶段调整偏移量（在速度方向上偏移，避免撞击）
+    local finalApproachDistance = currentApproachDistance
+    if approachPhase == 2 and speed < 0.5 then
+        finalApproachDistance = finalApproachDistance * 0.5
+    end
+    
+    -- 沿速度方向反向偏移
+    local velNorm = vectorNormalize(objectVel)
+    interceptPos[1] = interceptPos[1] - velNorm[1] * finalApproachDistance
+    interceptPos[2] = interceptPos[2] - velNorm[2] * finalApproachDistance
+    interceptPos[3] = interceptPos[3] - velNorm[3] * finalApproachDistance
+    
+    -- 额外固定偏移（可能是为了适应末端工具）
+    interceptPos[1] = interceptPos[1] + 0.0
+    interceptPos[2] = interceptPos[2] + 0.0
+    interceptPos[3] = interceptPos[3] + 0.05
+    
+    -- 限制在工作空间内
+    interceptPos = clampToWorkspace(interceptPos)
+    
+    -- 定期输出日志（每秒一次）
+    if sim.getSimulationTime() % 1.0 < 0.01 then
+        sim.addLog(sim.verbosity_scriptinfos,
+            string.format("阶段%d: 预测时间=%.2fs, 接近距离=%.3fm",
+            approachPhase, predTime, finalApproachDistance))
+    end
+    
+    return interceptPos
+end
+
+-- ========================= 抓取逻辑 =========================
+
+-- 功能：当末端与目标距离小于阈值时，标记为已抓取（并闭合夹爪）。
+-- ★ 距离检测仍基于真实位置。
+function simpleGrabOnProximity()
+    if grasped or targetObjectHandle == -1 then return end
+    if not isTracking then return end
+
+    local tipPos = sim.getObjectPosition(simTip, -1)
+    local objPos = sim.getObjectPosition(targetObjectHandle, -1)
+    local d = math.sqrt(
+        (objPos[1]-tipPos[1])^2 +
+        (objPos[2]-tipPos[2])^2 +
+        (objPos[3]-tipPos[3])^2
+    )
+
+    if d <= captureThreshold then
+        grasped = true
+        sim.addLog(sim.verbosity_scriptinfos,
+            string.format("[抓取] 距离 %.3f m，夹爪闭合", d))
+    end
+end
+
+-- ========================= 工作空间限制 =========================
+
+-- 功能：将位置约束在机械臂可达范围内（避免奇异点）
+function clampToWorkspace(position)
+    local workspaceRadius = 0.8
+    local basePos = sim.getObjectPosition(sim.getObject('..'), -1)
+    
+    local horizontalDist = math.sqrt(
+        (position[1] - basePos[1])^2 +
+        (position[2] - basePos[2])^2
+    )
+    
+    if horizontalDist > workspaceRadius then
+        local scale = workspaceRadius / horizontalDist
+        position[1] = basePos[1] + (position[1] - basePos[1]) * scale
+        position[2] = basePos[2] + (position[2] - basePos[2]) * scale
+    end
+    
+    -- 高度限制（0.1m ~ 1.2m）
+    position[3] = math.max(0.1, math.min(1.2, position[3]))
+    
+    return position
+end
+
+-- ========================= 姿态设置 =========================
+
+-- 功能：设置目标点的姿态（此处固定为便于抓取的朝向）
+function setTargetOrientation(targetHandle, objectVelocity)
+    -- 固定姿态，可根据需要调整
+    sim.setObjectOrientation(targetHandle, -1, {0, -math.pi/2, math.pi/2})
+end
+
+-- ========================= IK 失败处理 =========================
+
+-- 功能：当 IK 求解失败时输出警告，并尝试轻量求解
+function handleIKFailure()
+    if sim.getSimulationTime() % 2.0 < 0.01 then
+        local simTarget = sim.getObject('../Target')
+        local simTip = sim.getObject('../Tip')
+        local targetPos = sim.getObjectPosition(simTarget, -1)
+        local tipPos = sim.getObjectPosition(simTip, -1)
+        local posError = math.sqrt(
+            (targetPos[1] - tipPos[1])^2 +
+            (targetPos[2] - tipPos[2])^2 +
+            (targetPos[3] - tipPos[3])^2
+        )
+        sim.addLog(sim.verbosity_scriptwarnings, 
+            string.format("IK 求解失败，位置误差: %.4f m", posError))
+    end
+    -- 尝试用较短时间重新计算
+    simIK.handleIkGroup(ikEnv, ikGroup, {maxTime=0.02})
+end
+
+-- ========================= 状态监视（仅日志） =========================
+
+-- 功能：输出接近状态（调试用）
+function checkGraspStatus()
+    local tipPos = sim.getObjectPosition(simTip, -1)
+    local objectPos = sim.getObjectPosition(targetObjectHandle, -1)
+    local distance = math.sqrt(
+        (tipPos[1] - objectPos[1])^2 +
+        (tipPos[2] - objectPos[2])^2 +
+        (tipPos[3] - objectPos[3])^2
+    )
+    if approachPhase == 2 and distance < 0.03 then
+        if sim.getSimulationTime() % 0.5 < 0.01 then
+            sim.addLog(sim.verbosity_scriptinfos, 
+                string.format("接近目标: 距离 %.3f m", distance))
+        end
+    end
+end
+
+-- ========================= 夹爪 UI 回调函数 =========================
+
+-- 创建 UI
+function createUI()
+    local xml = [[
+    <ui title="Gripper Control_0" closeable="true" resizable="false">
+      <group layout="vbox" flat="true">
+        <label text="Gripper Control"/>
+        <group layout="hbox" flat="true">
+          <button text="Open"  on-click="openClicked"  id="1"/>
+          <button text="Close" on-click="closeClicked" id="2"/>
+        </group>
+        <label text="Finger Angle"/>
+        <hslider minimum="0" maximum="100"
+                 on-change="fingerAngleMoved" id="3"/>
+      </group>
+    </ui>
+    ]]
+    ui = simUI.create(xml)
+    simUI.setButtonPressed(ui, 1, gripState == 0)
+    simUI.setButtonPressed(ui, 2, gripState == 1)
+    simUI.setSliderValue(ui, 3, sliderV)
+end
+
+-- 打开按钮回调
+function openClicked(ui, id)
+    gripState = 0
+    simUI.setButtonPressed(ui, 1, true)
+    simUI.setButtonPressed(ui, 2, false)
+end
+
+-- 闭合按钮回调
+function closeClicked(ui, id)
+    gripState = 1
+    simUI.setButtonPressed(ui, 1, false)
+    simUI.setButtonPressed(ui, 2, true)
+end
+
+-- 手指角度滑块回调
+function fingerAngleMoved(ui, id, v)
+    sliderV = v
+    local ang = -math.pi * 0.5 + math.pi * sliderV / 100
+    sim.setJointTargetPosition(rotJointHandles[1], ang)
+    sim.setJointTargetPosition(rotJointHandles[2], ang)
+end
+
+-- ========================= UI 显示/隐藏管理 =========================
+
+function sysCall_nonSimulation()
+    local s = sim.getObjectSel()
+    local show = (s and #s == 1 and s[1] == modelHandle)
+    if show then
+        if not ui then createUI() end
+    else
+        if ui then
+            uiPos = {simUI.getPosition(ui)}
+            simUI.destroy(ui)
+            ui = nil
+        end
+    end
+end
+
+-- ========================= 清理 =========================
+
+function sysCall_cleanup()
+    if ui then
+        uiPos = {simUI.getPosition(ui)}
+        simUI.destroy(ui)
+        ui = nil
+    end
+end
+
+-- ============================================================================
+-- 注意：本脚本中的目标位置和速度均通过 sim.getObjectPosition() 直接从物理引擎
+--       获得，未使用任何图像处理或视觉传感器。此为仿真简化，真实场景需改为
+--       订阅 /f_M_o 话题（由 eyeinhand.cpp 或 trajpre.cpp 发布）来获取位姿。
+-- ============================================================================

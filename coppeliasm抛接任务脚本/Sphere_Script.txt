@@ -1,0 +1,27 @@
+-- ============================================================================
+-- 文件：/Sphere/Script
+-- 功能：在仿真初始化时为球体赋予一个初始速度，使其沿某一方向运动，
+--       模拟被抛掷的物体。这是“抛接”任务中目标的动态来源。
+-- 说明：速度参数是直接设置的，不依赖任何物理计算，仅用于展示预测算法。
+--       真实系统中，目标速度应由视觉估算。
+-- ============================================================================
+
+function sysCall_init()
+    sphereHandle = sim.getObject('..')  -- 当前物体（球体）
+    local objectType = sim.getObjectType(sphereHandle)
+    sim.addLog(sim.verbosity_scriptinfos, "Object type: " .. objectType)
+
+    -- 如果物体是形状，则设置初始速度（仿真特有的参数）
+    if objectType == sim.object_shape_type then
+        -- 设置线速度（世界坐标系）
+        sim.setObjectFloatParameter(sphereHandle, sim.shapefloatparam_init_velocity_x, 0.0)
+        sim.setObjectFloatParameter(sphereHandle, sim.shapefloatparam_init_velocity_y, 0.5)  -- 主要沿 Y 方向
+        sim.setObjectFloatParameter(sphereHandle, sim.shapefloatparam_init_velocity_z, 0.2)  -- 向上分量
+        sim.addLog(sim.verbosity_scriptinfos, "Initial velocity parameters set successfully")
+    else
+        sim.addLog(sim.verbosity_scriptwarnings, "Object is not a shape, cannot set initial velocity parameters")
+    end
+end
+
+-- 注意：此脚本仅在初始化时设置速度，之后球体的运动由物理引擎（重力、碰撞等）驱动。
+--       若需持续控制，可在 sysCall_actuation 中修改速度或施加力。

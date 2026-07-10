@@ -1,0 +1,70 @@
+-- ============================================================================
+-- 文件：/Plane/Script (CoppeliaSim 仿真脚本)
+-- 功能：驱动目标平板（带有四个圆点或 AprilTag）在水平面内做周期性运动，
+--       包括平移和绕自身 Z 轴的旋转，以测试视觉追踪算法的动态跟踪能力。
+-- 说明：本脚本不依赖任何外部输入，完全在仿真内部生成运动轨迹。
+--       平板每 60 个仿真步（约 1 秒，假设步长 0.01s）切换一次运动模式，
+--       依次沿 X 正方向、Y 正方向、X 负方向、Y 负方向平移，同时伴随绕 Z 轴的小角度旋转。
+--       这种复合运动可检验视觉节点（如 eyeinhand.cpp）的位姿估计鲁棒性。
+-- ============================================================================
+
+sim = require("sim")
+
+-- 初始化函数：获取平板句柄，设置初始状态
+function sysCall_init()
+    -- 获取场景中名为 "Plane" 的物体句柄
+    -- 注意：CoppeliaSim 中更推荐使用 sim.getObject()，但原代码使用 sim.getObjectHandle() 保持兼容
+    planeHandle = sim.getObjectHandle("Plane")
+    
+    -- 步数计数器（用于切换运动阶段）
+    stepCounter = 0
+    
+    -- 当前运动阶段索引（1~4 循环）
+    currentStage = 1
+    
+    -- 平移速度（米/步），步长由仿真时间步决定，此处很小，模拟缓慢运动
+    speed = 0.0025
+    
+    -- 四个阶段的运动参数：
+    -- direction: 平移方向（世界坐标系）
+    -- angle:     绕 Z 轴旋转的角度增量（弧度），正负交替产生往复旋转
+    stages = {
+        {direction = {1, 0, 0}, angle = math.pi/360},   -- 阶段1: 沿 X+ 平移，绕 Y 轴正向旋转
+        {direction = {0, 1, 0}, angle = -math.pi/360},  -- 阶段2: 沿 Y+ 平移，绕 Y 轴负向旋转
+        {direction = {-1, 0, 0}, angle = math.pi/360},  -- 阶段3: 沿 X- 平移，绕 Y 轴正向旋转
+        {direction = {0, -1, 0}, angle = -math.pi/360}  -- 阶段4: 沿 Y- 平移，绕 Y 轴负向旋转
+    }
+    
+    -- 记录平板的初始位置（用于复位或参考，本脚本未使用）
+    initialPosition = sim.getObjectPosition(planeHandle, -1)
+end
+
+-- 每次仿真步执行函数（主循环）
+function sysCall_actuation()
+    -- 1. 更新阶段计数器：每 60 步切换一次阶段（约 1 秒，取决于仿真时间步长）
+    stepCounter = stepCounter + 1
+    if stepCounter % 60 == 0 then
+        -- 阶段循环：1 → 2 → 3 → 4 → 1 ...
+        currentStage = (currentStage % 4) + 1
+    end
+    
+    -- 2. 旋转控制：在当前阶段绕 Z 轴增加一个小角度
+    local ang = stages[currentStage].angle          -- 当前阶段的角增量
+    local currentOri = sim.getObjectOrientation(planeHandle, -1)  -- 当前欧拉角 (rx, ry, rz)
+    -- 只修改 ry（绕 Y 轴），保持 rx 和 rz 不变
+    sim.setObjectOrientation(planeHandle, -1, {
+        currentOri[1], 
+        currentOri[2] + ang,  
+        currentOri[3]
+    })
+    
+    -- 3. 平移控制：在当前阶段沿指定的水平方向移动
+    local dir = stages[currentStage].direction      -- 当前阶段的平移方向向量
+    local currentPos = sim.getObjectPosition(planeHandle, -1)  -- 当前位置（世界坐标系）
+    local newPos = {
+        currentPos[1] + dir[1] * speed,
+        currentPos[2] + dir[2] * speed,
+        currentPos[3] + dir[3] * speed   -- Z 方向不变（dir[3] 始终为 0）
+    }
+    sim.setObjectPosition(planeHandle, -1, newPos)
+end

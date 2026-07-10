@@ -1,0 +1,87 @@
+-- ============================================================================
+-- 文件：/Vision_sensor/Script（追踪任务）
+-- 功能：将仿真图像发布到 ROS 话题 /image，供视觉节点 (eyeinhand/trajpre) 使用。
+--       本脚本仅负责图像传输，不参与位姿计算。
+-- ============================================================================
+
+sim = require('sim')
+simROS = require('simROS')
+simUI = require('simUI')
+
+-- 初始化函数（仿真开始时调用）
+function sysCall_init()
+    -- 获取当前视觉传感器（主动采集图像的传感器）
+    activeVisionSensor = sim.getObject('..')
+    -- 被动视觉传感器（用于显示接收到的图像，本例未实际使用）
+    passiveVisionSensor = sim.getObject('/Vision_sensor')
+
+    -- 创建 ROS 发布器，话题为 /image，消息类型 sensor_msgs/Image
+    pub = simROS.advertise('/image', 'sensor_msgs/Image')
+    -- 将 uint8 数组视为字符串处理，提高传输效率
+    simROS.publisherTreatUInt8ArrayAsString(pub)
+
+    -- 创建 ROS 订阅器（虽然脚本中订阅了 /image，但主要用于回环测试，在抛接中未使用）
+    sub = simROS.subscribe('/image', 'sensor_msgs/Image', 'imageMessage_callback')
+    simROS.subscriberTreatUInt8ArrayAsString(sub)
+
+    -- 如果 simUI 可用，创建一个用于保存深度矩阵的按钮（调试工具）
+    if simUI then
+        xml = [[
+        <ui title="Depth Capture" closeable="true">
+            <button text="Save 128x128 Depth" on-click="saveDepthMatrix"/>
+        </ui>
+        ]]
+        ui = simUI.create(xml)
+    end
+end
+
+-- UI 按钮回调：保存深度矩阵到 CSV 文件（仅调试用）
+function saveDepthMatrix()
+    -- 获取深度图像数据（浮点型）
+    local depthData,res = sim.getVisionSensorDepth(activeVisionSensor, 1)
+    local depthFloat = sim.unpackFloatTable(depthData)
+    local w, h = res[1], res[2]
+    sim.addLog(sim.verbosity_infos, "Depth matrix (first 10 values):")
+    for i=1,10 do
+        print(string.format("depth[%d] = %.4f", i, depthFloat[i]))
+    end
+    -- 写入文件（默认场景目录）
+    local file = io.open(sim.getStringParameter(sim.stringparam_scenedefaultdir) .. "/depth_256x256.csv", "w")
+    for i=1,#depthFloat do
+        file:write(depthFloat[i] .. "\n")
+    end
+    file:close()
+    sim.addLog(sim.verbosity_infos, "Depth matrix saved to depth_256x256.csv")
+end
+
+-- 图像订阅回调：将接收到的图像设置到被动视觉传感器（本例未真正使用）
+function imageMessage_callback(msg)
+    sim.setVisionSensorImg(passiveVisionSensor, msg.data)
+end
+
+-- 感知阶段（每次仿真步调用）：采集图像并发布到 ROS
+function sysCall_sensing()
+    -- 获取主动传感器的图像数据和分辨率
+    local data, resolution = sim.getVisionSensorImg(activeVisionSensor)
+    if data == nil then
+        print("Failed to get image data!")
+        return
+    end
+
+    -- 构造 sensor_msgs/Image 消息
+    d = {}
+    d.header = {stamp = simROS.getTime(), frame_id = 'a'}
+    d.height = resolution[2]
+    d.width = resolution[1]
+    d.encoding = 'rgb8'          -- 图像编码格式
+    d.is_bigendian = 1
+    d.step = resolution[1] * 3   -- 每行字节数（RGB 三个通道）
+    d.data = data                -- 图像数据（uint8 数组）
+    simROS.publish(pub, d)
+end
+
+-- 清理函数（仿真结束调用）
+function sysCall_cleanup()
+    simROS.shutdownPublisher(pub)
+    simROS.shutdownSubscriber(sub)
+end
